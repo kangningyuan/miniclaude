@@ -45,6 +45,8 @@ Thumbs.db
 .coverage
 htmlcov/
 .tox/
+.team/
+.task/
 
 # Linting
 .mypy_cache/

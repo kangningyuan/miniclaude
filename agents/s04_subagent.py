@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-s02_tool_use.py - Tools
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
-    +----------+      +-------+      +------------------+
-    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
-    |  prompt  |      |       |      | {                |
-    +----------+      +---+---+      |   bash: run_bash |
-                          ^          |   read: run_read |
-                          |          |   write: run_wr  |
-                          +----------+   edit: run_edit |
-                          tool_result| }                |
-                                     +------------------+
-Key insight: "The loop didn't change at all. I just added tools."
+s04_subagent.py - Subagents
+Spawn a child agent with fresh messages=[]. The child works in its own
+context, sharing the filesystem, then returns only a summary to the parent.
+    Parent agent                     Subagent
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- fresh
+    |                  |  dispatch   |                  |
+    | tool: task       | ---------->| while tool_use:  |
+    |   prompt="..."   |            |   call tools     |
+    |   description="" |            |   append results |
+    |                  |  summary   |                  |
+    |   result = "..." | <--------- | return last text |
+    +------------------+             +------------------+
+              |
+    Parent context stays clean.
+    Subagent context is discarded.
+Key insight: "Process isolation gives context isolation for free."
 """
 import os
 import subprocess
@@ -25,7 +29,9 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+# -- Tool implementations shared by parent and child --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -44,10 +50,9 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 def run_read(path: str, limit: int = None) -> str:
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
@@ -56,7 +61,7 @@ def run_write(path: str, content: str) -> str:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
 def run_edit(path: str, old_text: str, new_text: str) -> str:
@@ -75,7 +80,8 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
-TOOLS = [
+# Child gets all base tools except task (no recursive spawning)
+CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -85,11 +91,44 @@ TOOLS = [
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    for _ in range(30):  # safety limit
+        with client.messages.stream(
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+            tools=CHILD_TOOLS, max_tokens=8000,
+        ) as stream:
+            stop_reason = None
+            for event in stream:
+                if event.type == "content_block_delta" and hasattr(event, "delta"):
+                    if event.delta.type == "text_delta":
+                        print(event.delta.text, end="", flush=True)
+                elif event.type == "message_delta":
+                    stop_reason = event.delta.stop_reason
+            message = stream.get_final_message()
+        sub_messages.append({"role": "assistant", "content": message.content})
+        if stop_reason != "tool_use":
+            break
+        results = []
+        for block in message.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": results})
+    # Only the final text returns to the parent -- child context is discarded
+    return "".join(b.text for b in message.content if hasattr(b, "text")) or "(no summary)"
+# -- Parent tools: base tools + task dispatcher --
+PARENT_TOOLS = CHILD_TOOLS + [
+    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+]
 def agent_loop(messages: list):
     while True:
         with client.messages.stream(
             model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+            tools=PARENT_TOOLS, max_tokens=8000,
         ) as stream:
             stop_reason = None
             for event in stream:
@@ -105,16 +144,21 @@ def agent_loop(messages: list):
         results = []
         for block in message.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"\033[33m$ {block.name}: {output[:200]}\033[0m")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+                if block.name == "task":
+                    desc = block.input.get("description", "subtask")
+                    print(f"\033[33m$ task ({desc}): {block.input['prompt'][:80]}\033[0m")
+                    output = run_subagent(block.input["prompt"])
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                print(f"\033[33m$ {str(output)[:200]}\033[0m")
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
