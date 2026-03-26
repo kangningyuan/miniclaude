@@ -51,18 +51,23 @@ def run_bash(command: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
+        with client.messages.stream(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
-        )
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
-        # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        ) as stream:
+            stop_reason = None
+            for event in stream:
+                if event.type == "content_block_delta" and hasattr(event, "delta"):
+                    if event.delta.type == "text_delta":
+                        print(event.delta.text, end="", flush=True)
+                elif event.type == "message_delta":
+                    stop_reason = event.delta.stop_reason
+            message = stream.get_final_message()
+        messages.append({"role": "assistant", "content": message.content})
+        if stop_reason != "tool_use":
             return
-        # Execute each tool call, collect results
         results = []
-        for block in response.content:
+        for block in message.content:
             if block.type == "tool_use":
                 print(f"\033[33m$ {block.input['command']}\033[0m")
                 output = run_bash(block.input["command"])
